@@ -4,17 +4,20 @@ import numpy as np
 import requests
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import folium
 from streamlit_folium import st_folium
 from math import radians, sin, cos, sqrt, atan2
 import time
+import re
+import io
 
 # ========================================
 # PAGE CONFIG & TITLE
 # ========================================
-st.set_page_config(page_title="NOAA RigOps Dashboard", layout="wide")
-st.title("NOAA Offshore Drilling Dashboard")
-st.caption("Real-time marine data fused with MWD telemetry simulation")
+st.set_page_config(page_title="NOAA RigOps & MWD Wellbore Dashboard", layout="wide")
+st.title("NOAA Offshore Drilling & MWD Telemetry Platform")
+st.caption("Real-time marine buoy data fused with MWD telemetry and wellbore trajectory analytics")
 
 # ========================================
 # RIGS & BUOYS (6 CLOSEST)
@@ -35,7 +38,6 @@ buoy_info = {
     "42047": ("42047 - Keathley Canyon (NW)", 27.900, -88.022)
 }
 
-# BOEM RIG DETAILS (EXACT FORMAT)
 boem_rig_details = {
     "Olympus TLP": {
         "type": "Tension Leg Platform (TLP)",
@@ -71,7 +73,6 @@ boem_rig_details = {
     }
 }
 
-# Haversine distance (miles)
 def haversine(lat1, lon1, lat2, lon2):
     R = 3958.8
     dlat = radians(lat2 - lat1)
@@ -79,6 +80,178 @@ def haversine(lat1, lon1, lat2, lon2):
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
+
+# ========================================
+# MINIMUM CURVATURE ENGINE (SPE / API STANDARD)
+# ========================================
+def calculate_minimum_curvature(md_arr, inc_arr, azi_arr):
+    n = len(md_arr)
+    tvd, ns, ew, dls = np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n)
+    inc = np.radians(inc_arr)
+    azi = np.radians(azi_arr)
+
+    for i in range(1, n):
+        d_md = md_arr[i] - md_arr[i-1]
+        if d_md <= 0:
+            tvd[i], ns[i], ew[i] = tvd[i-1], ns[i-1], ew[i-1]
+            continue
+
+        i1, i2 = inc[i-1], inc[i]
+        a1, a2 = azi[i-1], azi[i]
+
+        cos_dl = np.cos(i2 - i1) - (np.sin(i1) * np.sin(i2) * (1.0 - np.cos(a2 - a1)))
+        dl = np.arccos(np.clip(cos_dl, -1.0, 1.0))
+        rf = 1.0 if dl < 1e-6 else (2.0 / dl) * np.tan(dl / 2.0)
+
+        tvd[i] = tvd[i-1] + (d_md / 2.0) * (np.cos(i1) + np.cos(i2)) * rf
+        ns[i]  = ns[i-1]  + (d_md / 2.0) * (np.sin(i1) * np.cos(a1) + np.sin(i2) * np.cos(a2)) * rf
+        ew[i]  = ew[i-1]  + (d_md / 2.0) * (np.sin(i1) * np.sin(a1) + np.sin(i2) * np.sin(a2)) * rf
+        dls[i] = np.degrees(dl) * (100.0 / d_md)
+
+    vs = np.sqrt(ns**2 + ew**2)
+    return pd.DataFrame({'TVD': tvd, 'NS': ns, 'EW': ew, 'VS': vs, 'DLS': dls})
+
+# ========================================
+# ROBUST LAS & SURVEY PARSER
+# ========================================
+def parse_mwd_file(file_bytes_or_str):
+    if isinstance(file_bytes_or_str, bytes):
+        text = file_bytes_or_str.decode('utf-8', errors='ignore')
+    elif hasattr(file_bytes_or_str, 'read'):
+        text = file_bytes_or_str.read().decode('utf-8', errors='ignore')
+    else:
+        text = str(file_bytes_or_str)
+
+    lines = text.splitlines()
+    header_info = {}
+    survey_lines, ascii_lines, curve_names = [], [], []
+    current_sec = None
+
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith('~'):
+            sec = s[1:].upper()
+            if sec.startswith('V'): current_sec = 'VERSION'
+            elif sec.startswith('W'): current_sec = 'WELL'
+            elif sec.startswith('C'): current_sec = 'CURVE'
+            elif sec.startswith('P'): current_sec = 'PARAM'
+            elif sec.startswith('O'): current_sec = 'OTHER'
+            elif sec.startswith('A'): current_sec = 'ASCII'
+            else: current_sec = sec
+            continue
+
+        if current_sec == 'WELL':
+            m = re.match(r'^([^.]+)\.([^\:]*)\:(.*)$', line)
+            if m:
+                header_info[m.group(1).strip()] = {'value': m.group(2).strip(), 'desc': m.group(3).strip()}
+        elif current_sec == 'OTHER':
+            survey_lines.append(s)
+        elif current_sec == 'CURVE':
+            m = re.match(r'^([^.]+)\.([^\:]*)\:(.*)$', line)
+            if m:
+                curve_names.append(m.group(1).strip())
+        elif current_sec == 'ASCII':
+            ascii_lines.append(s)
+
+    # 1. Parse survey table from ~Other (Noralis / WellBenders NISE format)
+    df_survey = None
+    if survey_lines:
+        header_idx = -1
+        for i, l in enumerate(survey_lines):
+            ul = l.upper()
+            if 'DEPTH' in ul or 'INCL' in ul or 'TVD' in ul:
+                header_idx = i
+                break
+
+        if header_idx != -1:
+            raw_cols = re.sub(r'[#]', '', survey_lines[header_idx]).split()
+            clean_cols = []
+            for c in raw_cols:
+                cu = c.upper()
+                if 'DEPTH' in cu or cu == 'MD': clean_cols.append('MD')
+                elif 'INC' in cu: clean_cols.append('INC')
+                elif 'AZM' in cu or 'AZI' in cu: clean_cols.append('AZI')
+                elif 'TVD' in cu: clean_cols.append('TVD')
+                elif cu in ['VS', 'VSEC', 'VERT_SECT']: clean_cols.append('VS')
+                elif 'N/' in cu or 'NORTH' in cu or cu == 'NS': clean_cols.append('NS')
+                elif 'E/' in cu or 'EAST' in cu or cu == 'EW': clean_cols.append('EW')
+                elif 'DLS' in cu: clean_cols.append('DLS')
+                elif 'TRACK' in cu: clean_cols.append('TRACK')
+                elif 'SURV' in cu: clean_cols.append('SURVEY')
+                else: clean_cols.append(c)
+
+            records = []
+            for l in survey_lines[header_idx+1:]:
+                if not l or l.startswith('#'): continue
+                parts = l.split()
+                if len(parts) < len(clean_cols): continue
+                if len(parts) > len(clean_cols):
+                    if len(parts) == len(clean_cols) + 1 and parts[1].upper() == 'TIE' and parts[2].upper() == 'IN':
+                        parts = [parts[0], 'Tie In'] + parts[3:]
+                    else:
+                        excess = len(parts) - len(clean_cols)
+                        merged = ' '.join(parts[1:1+excess+1])
+                        parts = [parts[0], merged] + parts[1+excess+1:]
+                records.append(parts[:len(clean_cols)])
+
+            if records:
+                df_survey = pd.DataFrame(records, columns=clean_cols)
+                for num_col in ['MD', 'INC', 'AZI', 'TVD', 'VS', 'NS', 'EW', 'DLS']:
+                    if num_col in df_survey.columns:
+                        df_survey[num_col] = pd.to_numeric(df_survey[num_col], errors='coerce')
+
+    # 2. Parse continuous log curves from ~A
+    df_log = None
+    if ascii_lines and curve_names:
+        log_rows = [l.split() for l in ascii_lines if l.strip()]
+        if log_rows:
+            ncols = min(len(curve_names), len(log_rows[0]))
+            df_log = pd.DataFrame(log_rows, columns=curve_names[:ncols])
+            for c in df_log.columns:
+                df_log[c] = pd.to_numeric(df_log[c], errors='coerce')
+                df_log.loc[df_log[c] < -900, c] = np.nan
+
+    # 3. Fallback: CSV if ~Other was not present
+    if df_survey is None:
+        try:
+            df_raw = pd.read_csv(io.StringIO(text))
+            col_map = {}
+            for c in df_raw.columns:
+                cu = str(c).upper().strip()
+                if 'DEPTH' in cu or cu == 'MD': col_map[c] = 'MD'
+                elif 'INC' in cu: col_map[c] = 'INC'
+                elif 'AZ' in cu: col_map[c] = 'AZI'
+                elif 'TVD' in cu: col_map[c] = 'TVD'
+                elif 'N/' in cu or cu == 'NS': col_map[c] = 'NS'
+                elif 'E/' in cu or cu == 'EW': col_map[c] = 'EW'
+                elif 'VS' in cu: col_map[c] = 'VS'
+                elif 'DLS' in cu: col_map[c] = 'DLS'
+            if 'MD' in col_map.values() and 'INC' in col_map.values() and 'AZI' in col_map.values():
+                df_survey = df_raw.rename(columns=col_map)
+                for c in ['MD', 'INC', 'AZI', 'TVD', 'NS', 'EW', 'VS', 'DLS']:
+                    if c in df_survey.columns:
+                        df_survey[c] = pd.to_numeric(df_survey[c], errors='coerce')
+        except Exception:
+            pass
+
+    # 4. If TVD / NS / EW are missing, compute using Minimum Curvature
+    if df_survey is not None and not df_survey.empty:
+        df_survey = df_survey.dropna(subset=['MD']).sort_values('MD').reset_index(drop=True)
+        needed = ['TVD', 'NS', 'EW', 'VS', 'DLS']
+        if not all(col in df_survey.columns for col in needed):
+            if 'INC' in df_survey.columns and 'AZI' in df_survey.columns:
+                mc = calculate_minimum_curvature(
+                    df_survey['MD'].values,
+                    df_survey['INC'].fillna(0).values,
+                    df_survey['AZI'].fillna(0).values
+                )
+                for col in needed:
+                    if col not in df_survey.columns or df_survey[col].isna().all():
+                        df_survey[col] = mc[col]
+
+    return header_info, df_survey, df_log
 
 # ========================================
 # SIDEBAR: CONTROLS
@@ -95,9 +268,9 @@ with st.sidebar:
     )
     st.header("Why This Matters")
     st.write("""
-    - **Submarine Sonar** = Real-time signal processing
-    - **MWD Drilling** = Same math: gamma, resistivity, torque
-    - **Energy Tech** = Multi-source fusion for ops
+    - **Submarine Sonar** = Real-time acoustic signal processing
+    - **MWD Drilling** = Mud-pulse telemetry: gamma, resistivity, torque
+    - **Energy Tech** = Marine metocean & downhole multi-source sensor fusion
     """)
     st.info("NOAA 420xx → Gulf Fleet → Multi-rig sensor analogy")
     st.header("MWD Pulse Simulator")
@@ -108,12 +281,11 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# ENSURE selected_buoys is never empty
 if not selected_buoys:
     selected_buoys = ["42001"]
 
 # ========================================
-# NOAA DATA FETCH — ROBUST, REAL, NO NAN
+# NOAA DATA FETCH
 # ========================================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_realtime(station_id):
@@ -170,7 +342,6 @@ def fetch_spectral(station_id):
     except:
         pass
 
-    # UNIQUE SIMULATED SPECTRUM PER BUOY
     np.random.seed(int(station_id[-3:]) % 100)
     freqs = np.linspace(0.03, 0.40, 25)
     peak = 0.08 + 0.04 * (int(station_id[-2:]) / 100)
@@ -180,68 +351,49 @@ def fetch_spectral(station_id):
     return df
 
 # ========================================
-# 1. NOAA BUOY DATA — 100% STABLE
+# 1. NOAA BUOY DATA
 # ========================================
 st.markdown("## NOAA Buoy Data — Live Environmental Conditions")
 
-if not selected_buoys or selected_buoys[0] not in buoy_info:
-    primary = list(buoy_info.keys())[0]
-else:
-    primary = selected_buoys[0]
-
+primary = selected_buoys[0] if (selected_buoys and selected_buoys[0] in buoy_info) else list(buoy_info.keys())[0]
 rt = fetch_realtime(primary)
 b_lat, b_lon = buoy_info[primary][1], buoy_info[primary][2]
-
-wave_height = f"{rt['WVHT']:.1f} ft"
-dom_period = f"{rt['DPD']:.1f} s"
-wind_speed = f"{rt['WSPD']:.1f} kt"
-wind_dir = f"{int(rt['WD'])} degrees"
-pressure = f"{rt['PRES']:.2f} inHg"
-wave_dir = f"{int(rt['MWD'])} degrees"
-sea_temp = f"{rt['WTMP']:.1f} degrees F"
-air_temp = f"{rt['ATMP']:.1f} degrees F"
-current_speed = f"{np.random.uniform(0.5, 2.0):.1f} kt"
-humidity = f"{np.random.randint(60, 95)} percent"
-visibility = f"{np.random.uniform(5, 15):.1f} mi"
 
 nearest_rig = min(real_rigs, key=lambda r: haversine(b_lat, b_lon, r["lat"], r["lon"]))
 dist = haversine(b_lat, b_lon, nearest_rig["lat"], nearest_rig["lon"])
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric("Wave Height", wave_height)
-    st.metric("Dom. Period", dom_period)
-    st.metric("Wind Speed", wind_speed)
-    st.metric("Wind Dir", wind_dir)
+    st.metric("Wave Height", f"{rt['WVHT']:.1f} ft")
+    st.metric("Dom. Period", f"{rt['DPD']:.1f} s")
+    st.metric("Wind Speed", f"{rt['WSPD']:.1f} kt")
+    st.metric("Wind Dir", f"{int(rt['WD'])} degrees")
 with col2:
-    st.metric("Barometric Pressure", pressure)
-    st.metric("Wave Dir", wave_dir)
-    st.metric("Sea Temp", sea_temp)
-    st.metric("Current Speed", current_speed)
+    st.metric("Barometric Pressure", f"{rt['PRES']:.2f} inHg")
+    st.metric("Wave Dir", f"{int(rt['MWD'])} degrees")
+    st.metric("Sea Temp", f"{rt['WTMP']:.1f} degrees F")
+    st.metric("Current Speed", f"{np.random.uniform(0.5, 2.0):.1f} kt")
 with col3:
-    st.metric("Air Temp", air_temp)
-    st.metric("Humidity", humidity)
-    st.metric("Visibility", visibility)
+    st.metric("Air Temp", f"{rt['ATMP']:.1f} degrees F")
+    st.metric("Humidity", f"{np.random.randint(60, 95)} percent")
+    st.metric("Visibility", f"{np.random.uniform(5, 15):.1f} mi")
     st.metric("Nearest Rig", f"{nearest_rig['name']} ({dist:.0f} mi)")
 
 # ========================================
-# 2. SIMULATED ACTIVE SONAR PING (MWD PULSE)
+# 2. SIMULATED ACTIVE SONAR PING
 # ========================================
 st.markdown("## Simulated Active Sonar Ping (MWD Pulse)")
 t = np.linspace(0, 2, 200)
 ping = np.sin(2 * np.pi * 5 * t) * np.exp(-t*3)
-ping_df = pd.DataFrame({"Time (s)": t, "Amplitude": ping})
 fig_mwd = go.Figure()
-fig_mwd.add_trace(go.Scatter(x=ping_df["Time (s)"], y=ping_df["Amplitude"],
-                             mode='lines', name='MWD Pulse', line=dict(color='cyan')))
+fig_mwd.add_trace(go.Scatter(x=t, y=ping, mode='lines', name='MWD Pulse', line=dict(color='cyan')))
 fig_mwd.update_layout(title="MWD Pulse Downhole (Analog to Resistivity)", height=300, template="plotly_dark")
 st.plotly_chart(fig_mwd, use_container_width=True)
 
 # ========================================
-# 3. MWD 6-PACK TELEMETRY — SMOOTH, NO RERUN
+# 3. MWD 6-PACK TELEMETRY
 # ========================================
 st.markdown("## MWD 6-Pack Telemetry")
-
 if not (len(bit_pattern) == 4 and all(c in '01' for c in bit_pattern)):
     bit_pattern = "1010"
 
@@ -255,12 +407,12 @@ def add_pulse(t, center, width, height):
     rise = width * 0.2
     flat = width * 0.6
     fall = width * 0.2
-    mask_rise = (t >= center) & (t < center + rise)
-    mask_flat = (t >= center + rise) & (t < center + rise + flat)
-    mask_fall = (t >= center + rise + flat) & (t < center + width)
-    signal[mask_rise] = height * (t[mask_rise] - center) / rise
-    signal[mask_flat] = height
-    signal[mask_fall] = height * (1 - (t[mask_fall] - (center + rise + flat)) / fall)
+    m_rise = (t >= center) & (t < center + rise)
+    m_flat = (t >= center + rise) & (t < center + rise + flat)
+    m_fall = (t >= center + rise + flat) & (t < center + width)
+    signal[m_rise] = height * (t[m_rise] - center) / rise
+    signal[m_flat] = height
+    signal[m_fall] = height * (1 - (t[m_fall] - (center + rise + flat)) / fall)
 
 add_pulse(t_full, clear_width / 2, clear_width, 1.0)
 add_pulse(t_full, clear_width + 0.5, clear_width, 1.0)
@@ -270,18 +422,14 @@ for i, bit in enumerate(bit_pattern):
     add_pulse(t_full, center, pulse_width, height)
 signal += np.random.normal(0, 0.08, len(t_full))
 
-if 'running' not in st.session_state:
-    st.session_state.running = False
-if 'offset' not in st.session_state:
-    st.session_state.offset = 0
+if 'running' not in st.session_state: st.session_state.running = False
+if 'offset' not in st.session_state: st.session_state.offset = 0
 
 if st.button("Start Live Telemetry" if not st.session_state.running else "Stop Live Telemetry"):
     st.session_state.running = not st.session_state.running
-    if not st.session_state.running:
-        st.session_state.offset = 0
+    if not st.session_state.running: st.session_state.offset = 0
 
 plot_placeholder = st.empty()
-
 if st.session_state.running:
     while st.session_state.running:
         st.session_state.offset = (st.session_state.offset + 0.02) % packet_duration
@@ -302,8 +450,266 @@ else:
     plot_placeholder.plotly_chart(fig_static, use_container_width=True)
 
 # ========================================
-# 4. WAVE ENERGY vs RIG PROXIMITY — NOW UNIQUE PER BUOY
+# 4. MWD WELLBORE TRAJECTORY & LAS VIEWER (FIXED)
 # ========================================
+st.markdown("---")
+st.markdown("## 🎯 Directional Wellbore Trajectory & MWD Logging")
+st.markdown("Upload any directional drilling survey (`.las`, `.csv`, `.txt`). Built with **dual SVG/WebGL visualization** to guarantee 100% display uptime across all browsers.")
+
+las_uploader = st.file_uploader(
+    "Choose a LAS / Directional Survey File (e.g. University_9_2009_WA_LAS.las)",
+    type=["las", "csv", "txt"],
+    key="wellbore_file_uploader"
+)
+
+header_info = {}
+df_survey = None
+df_log = None
+
+if las_uploader is not None:
+    try:
+        content = las_uploader.getvalue()
+        header_info, df_survey, df_log = parse_mwd_file(content)
+        if df_survey is not None and not df_survey.empty:
+            st.success(f" Successfully loaded `{las_uploader.name}` — parsed {len(df_survey)} survey stations!")
+        else:
+            st.warning("File uploaded, but no survey stations could be extracted. Please check file format.")
+    except Exception as e:
+        st.error(f"Error parsing file: {e}")
+
+if df_survey is None or df_survey.empty:
+    st.info("💡 **Demo Mode**: Showing baseline trajectory from **University 9 2009 WA** (Sequitur Energy / WellBenders). Upload your file above to replace.")
+    sample_records = [
+        {"TRACK": "1", "SURVEY": "Tie In", "MD": 0.0, "INC": 0.0, "AZI": 0.0, "TVD": 0.0, "VS": 0.0, "NS": 0.0, "EW": 0.0, "DLS": 0.0},
+        {"TRACK": "1", "SURVEY": "1", "MD": 113.0, "INC": 0.70, "AZI": 236.84, "TVD": 113.0, "VS": 0.39, "NS": -0.38, "EW": -0.58, "DLS": 0.62},
+        {"TRACK": "1", "SURVEY": "10", "MD": 1013.0, "INC": 0.30, "AZI": 223.84, "TVD": 1012.97, "VS": -3.03, "NS": 3.04, "EW": -0.38, "DLS": 0.44},
+        {"TRACK": "1", "SURVEY": "20", "MD": 1970.0, "INC": 10.46, "AZI": 247.80, "TVD": 1966.67, "VS": 21.39, "NS": -20.26, "EW": -55.72, "DLS": 1.82},
+        {"TRACK": "1", "SURVEY": "30", "MD": 2915.0, "INC": 15.47, "AZI": 226.09, "TVD": 2883.93, "VS": 136.80, "NS": -131.74, "EW": -249.52, "DLS": 0.38},
+        {"TRACK": "1", "SURVEY": "40", "MD": 3856.0, "INC": 15.82, "AZI": 257.99, "TVD": 3794.00, "VS": 228.72, "NS": -219.28, "EW": -464.90, "DLS": 0.54},
+        {"TRACK": "1", "SURVEY": "50", "MD": 4798.0, "INC": 14.11, "AZI": 242.79, "TVD": 4707.19, "VS": 306.26, "NS": -292.40, "EW": -682.11, "DLS": 0.72},
+        {"TRACK": "1", "SURVEY": "60", "MD": 5737.0, "INC": 9.85, "AZI": 239.01, "TVD": 5620.70, "VS": 418.63, "NS": -401.00, "EW": -867.75, "DLS": 0.95},
+        {"TRACK": "1", "SURVEY": "70", "MD": 6675.0, "INC": 2.51, "AZI": 266.78, "TVD": 6550.95, "VS": 477.61, "NS": -457.94, "EW": -968.18, "DLS": 1.51},
+        {"TRACK": "1", "SURVEY": "80", "MD": 7611.0, "INC": 8.31, "AZI": 184.96, "TVD": 7486.47, "VS": 484.40, "NS": -464.55, "EW": -976.91, "DLS": 8.89},
+        {"TRACK": "1", "SURVEY": "81", "MD": 7706.0, "INC": 21.41, "AZI": 180.30, "TVD": 7578.10, "VS": 508.69, "NS": -488.83, "EW": -977.60, "DLS": 13.84}
+    ]
+    df_survey = pd.DataFrame(sample_records)
+    header_info = {
+        "WELL": {"value": "University 9 2009 WA"},
+        "RIG": {"value": "ICD 307"},
+        "COMP": {"value": "Sequitur Energy Resources LLC"},
+        "API": {"value": "42-383-41703"},
+        "FLD": {"value": "Texon"}
+    }
+
+well_name = header_info.get("WELL", {}).get("value", "Well 1")
+rig_name = header_info.get("RIG", {}).get("value", "Drilling Rig")
+operator_name = header_info.get("COMP", {}).get("value", "Offshore Operator")
+api_num = header_info.get("API", {}).get("value", "N/A")
+
+final_md = df_survey["MD"].iloc[-1]
+final_tvd = df_survey["TVD"].iloc[-1]
+max_inc = df_survey["INC"].max()
+final_inc = df_survey["INC"].iloc[-1]
+final_azi = df_survey["AZI"].iloc[-1]
+final_ns = df_survey["NS"].iloc[-1]
+final_ew = df_survey["EW"].iloc[-1]
+closure_dist = np.sqrt(final_ns**2 + final_ew**2)
+closure_azi = (np.degrees(np.arctan2(final_ew, final_ns)) + 360) % 360
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("Well Name", well_name, f"Rig: {rig_name}")
+    st.metric("Total Measured Depth (MD)", f"{final_md:,.1f} ft")
+with c2:
+    st.metric("Operator", operator_name, f"API: {api_num}")
+    st.metric("True Vertical Depth (TVD)", f"{final_tvd:,.1f} ft")
+with c3:
+    st.metric("Max Inclination", f"{max_inc:.2f}°", f"Current: {final_inc:.2f}°")
+    st.metric("Current Azimuth", f"{final_azi:.1f}°")
+with c4:
+    st.metric("Closure Distance", f"{closure_dist:,.1f} ft")
+    st.metric("Closure Azimuth", f"{closure_azi:.1f}°")
+
+view_mode = st.radio(
+    "Select Trajectory Display Mode:",
+    options=[
+        "📐 2D Directional Plan & Section Views (Recommended — 100% SVG, No WebGL Required)",
+        "🌐 3D Interactive Trajectory (Requires WebGL Support)",
+        "📈 Formation Logs (Gamma Ray & ROP)",
+        "📋 Full Survey Stations Table"
+    ],
+    horizontal=True
+)
+
+if "2D Directional Plan & Section" in view_mode:
+    col_plan, col_sect = st.columns(2)
+
+    with col_plan:
+        fig_plan = go.Figure()
+        fig_plan.add_trace(go.Scatter(
+            x=df_survey["EW"], y=df_survey["NS"],
+            mode="lines+markers",
+            name="Wellpath",
+            line=dict(color="#00f2fe", width=4),
+            marker=dict(
+                size=6,
+                color=df_survey["INC"],
+                colorscale="Viridis",
+                colorbar=dict(title="Inc (°)"),
+                showscale=True
+            ),
+            hovertemplate="<b>MD:</b> %{customdata[0]:.1f} ft<br><b>TVD:</b> %{customdata[1]:.1f} ft<br><b>Inc:</b> %{customdata[2]:.2f}°<br><b>E/W:</b> %{x:.1f} ft<br><b>N/S:</b> %{y:.1f} ft<extra></extra>",
+            customdata=df_survey[["MD", "TVD", "INC"]].values
+        ))
+        fig_plan.add_trace(go.Scatter(
+            x=[0], y=[0],
+            mode="markers+text",
+            name="Surface Wellhead",
+            marker=dict(size=14, color="#ff4444", symbol="cross"),
+            text=["Surface (0,0)"],
+            textposition="top right"
+        ))
+        fig_plan.add_trace(go.Scatter(
+            x=[final_ew], y=[final_ns],
+            mode="markers+text",
+            name="Bit Position",
+            marker=dict(size=14, color="#00ff88", symbol="diamond"),
+            text=[f"Bit ({final_md:.0f} ft)"],
+            textposition="bottom left"
+        ))
+        fig_plan.update_layout(
+            title="<b>Plan View (Top-Down: East-West vs North-South)</b><br><sup>Pure 2D Vector SVG — 100% Reliable in All Browsers</sup>",
+            xaxis_title="East / -West Departure (ft)",
+            yaxis_title="North / -South Departure (ft)",
+            template="plotly_dark",
+            height=500,
+            yaxis=dict(scaleanchor="x", scaleratio=1)
+        )
+        st.plotly_chart(fig_plan, use_container_width=True)
+
+    with col_sect:
+        fig_sect = go.Figure()
+        x_col = "VS" if "VS" in df_survey.columns and df_survey["VS"].notna().any() else "NS"
+        fig_sect.add_trace(go.Scatter(
+            x=df_survey[x_col], y=df_survey["TVD"],
+            mode="lines+markers",
+            name="Vertical Section Profile",
+            line=dict(color="#ff9900", width=4),
+            marker=dict(
+                size=6,
+                color=df_survey["INC"],
+                colorscale="Plasma",
+                colorbar=dict(title="Inc (°)"),
+                showscale=True
+            ),
+            hovertemplate=f"<b>MD:</b> %{{customdata[0]:.1f}} ft<br><b>TVD:</b> %{{y:.1f}} ft<br><b>{x_col}:</b> %{{x:.1f}} ft<br><b>Inc:</b> %{{customdata[1]:.2f}}°<extra></extra>",
+            customdata=df_survey[["MD", "INC"]].values
+        ))
+        fig_sect.update_layout(
+            title="<b>Section View (Profile: True Vertical Depth vs Section)</b><br><sup>Drilling Depth Inverted — 100% SVG, Zero WebGL Dependency</sup>",
+            xaxis_title=f"{'Vertical Section (ft)' if x_col == 'VS' else 'Horizontal Departure (ft)'}",
+            yaxis_title="True Vertical Depth TVD (ft)",
+            yaxis=dict(autorange="reversed"),
+            template="plotly_dark",
+            height=500
+        )
+        st.plotly_chart(fig_sect, use_container_width=True)
+
+elif "3D Interactive Trajectory" in view_mode:
+    st.warning("⚠️ **Note**: 3D Trajectory rendering requires **WebGL & GPU acceleration** in your browser. If you see a grey box with *'WebGL is not supported'*, switch back to the **2D Directional Plan & Section Views** above or enable Hardware Acceleration in your browser settings.")
+
+    fig_3d = go.Figure()
+    fig_3d.add_trace(go.Scatter3d(
+        x=df_survey["EW"],
+        y=df_survey["NS"],
+        z=df_survey["TVD"],
+        mode="lines+markers",
+        name="3D Trajectory",
+        line=dict(color="#00f2fe", width=6),
+        marker=dict(
+            size=4,
+            color=df_survey["INC"],
+            colorscale="Viridis",
+            colorbar=dict(title="Inclination (°)"),
+            showscale=True
+        ),
+        hovertemplate="<b>MD:</b> %{customdata[0]:.1f} ft<br><b>TVD:</b> %{z:.1f} ft<br><b>E/W:</b> %{x:.1f} ft<br><b>N/S:</b> %{y:.1f} ft<extra></extra>",
+        customdata=df_survey[["MD"]].values
+    ))
+    fig_3d.update_layout(
+        title="<b>3D Wellbore Trajectory (Interactive Orbit)</b>",
+        scene=dict(
+            xaxis_title="East / -West (ft)",
+            yaxis_title="North / -South (ft)",
+            zaxis_title="True Vertical Depth (ft)",
+            zaxis=dict(autorange="reversed"),
+            camera=dict(eye=dict(x=1.6, y=1.6, z=0.8))
+        ),
+        template="plotly_dark",
+        height=650
+    )
+    st.plotly_chart(fig_3d, use_container_width=True)
+
+    with st.expander("🛠️ How to Enable WebGL in your Browser if this is blank:"):
+        st.markdown("""
+        - **Google Chrome / Microsoft Edge**:
+          1. Open `chrome://settings/system` (or `edge://settings/system`).
+          2. Toggle **ON**: *"Use graphics acceleration when available"*.
+          3. Click **Relaunch**.
+        - **Apple Safari**:
+          1. Safari > Settings > Advanced > Check *"Show features for web developers"*.
+          2. In menu bar: Develop > Feature Flags > Ensure **WebGL** is enabled.
+        - **Firefox**:
+          1. Go to `about:config` and ensure `webgl.disabled` is set to `false`.
+        """)
+
+elif "Formation Logs" in view_mode:
+    if df_log is not None and not df_log.empty:
+        st.subheader("MWD Continuous Formation Evaluation Logs")
+        depth_col = "DEPTH" if "DEPTH" in df_log.columns else df_log.columns[0]
+        gr_col = "GR_MWD" if "GR_MWD" in df_log.columns else ("GR" if "GR" in df_log.columns else None)
+        rop_col = "ROP" if "ROP" in df_log.columns else None
+
+        fig_log = make_subplots(
+            rows=1, cols=2,
+            shared_yaxes=True,
+            subplot_titles=("Track 1: Gamma Ray (GR)", "Track 2: Rate of Penetration (ROP)")
+        )
+
+        if gr_col:
+            fig_log.add_trace(
+                go.Scatter(x=df_log[gr_col], y=df_log[depth_col], mode="lines", line=dict(color="#22c55e", width=1.5), name="Gamma Ray (API)"),
+                row=1, col=1
+            )
+        if rop_col:
+            fig_log.add_trace(
+                go.Scatter(x=df_log[rop_col], y=df_log[depth_col], mode="lines", line=dict(color="#f97316", width=1.5), name="ROP (ft/hr)"),
+                row=1, col=2
+            )
+
+        fig_log.update_yaxes(autorange="reversed", title_text="Measured Depth (ft)", row=1, col=1)
+        fig_log.update_xaxes(title_text="GR (API)", row=1, col=1)
+        fig_log.update_xaxes(title_text="ROP (ft/hr)", row=1, col=2)
+        fig_log.update_layout(template="plotly_dark", height=600, showlegend=False)
+        st.plotly_chart(fig_log, use_container_width=True)
+    else:
+        st.info("Continuous log curves (~Ascii block) were not present in the uploaded survey file.")
+
+elif "Full Survey Stations Table" in view_mode:
+    st.subheader(f"Directional Survey Stations ({len(df_survey)} Stations)")
+    st.dataframe(df_survey, use_container_width=True)
+    csv_data = df_survey.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download Survey Table (CSV)",
+        data=csv_data,
+        file_name=f"{well_name.replace(' ', '_')}_surveys.csv",
+        mime="text/csv"
+    )
+
+# ========================================
+# 5. WAVE ENERGY vs RIG PROXIMITY
+# ========================================
+st.markdown("---")
 st.markdown("## Wave Energy vs Rig Proximity")
 
 spectral_dfs = []
@@ -347,7 +753,7 @@ else:
     st.warning("No spectral data available — check NOAA .spec files.")
 
 # ========================================
-# 6. WAVE PROPAGATION — BUOYS → RIGS (REAL-TIME PREDICTION)
+# 6. WAVE PROPAGATION — BUOYS → RIGS
 # ========================================
 st.markdown("## Wave Propagation to Rigs — Real-Time Motion Forecast")
 
@@ -428,12 +834,11 @@ else:
     st.info("Select **2+ buoys** to enable wave propagation forecast.")
 
 # ========================================
-# 5. GULF OF MEXICO — RIGS & BUOYS (BOEM POPUPS + NOAA DATA)
+# 7. GULF OF MEXICO — RIGS & BUOYS
 # ========================================
 st.markdown("## Gulf of Mexico — Rigs & Buoys")
 
 buoy_data = {bid: fetch_realtime(bid) for bid in selected_buoys}
-
 m = folium.Map(location=[27.5, -88.5], zoom_start=7, tiles="CartoDB dark_matter")
 
 for rig in real_rigs:
@@ -494,9 +899,7 @@ st_folium(m, width=1000, height=500, key="map")
 # FOOTER / CTA
 # ========================================
 st.success("""
-
-
-A real-time offshore drilling intelligence platform that fuses NOAA buoy data, LAS or CSV data from MWD tools TRY UPLOADING YOUR LAS! 
+A real-time offshore drilling intelligence platform that fuses NOAA buoy data, LAS or CSV data from MWD tools,
 BOEM rig assets, and MWD telemetry into a predictive rig safety and operations dashboard
-— delivering wave propagation forecasts, motion risk, and environmental fusion. If nothing else a fun learning device.
-""")
+— delivering wave propagation forecasts, motion risk, and environmental fusion.
+"""
