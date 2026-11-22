@@ -1007,7 +1007,7 @@ if survey_file is not None:
                                 critical_axial.style.format({
                                     'Depth (ft)': '{:.1f}',
                                     'Shock (G)': '{:.1f}'
-                                }).applymap(color_shock, subset=['Shock (G)']),
+                                }).map(color_shock, subset=['Shock (G)']),
                                 height=300
                             )
                             st.caption(f"Total: {len(critical_axial)} events")
@@ -1034,7 +1034,7 @@ if survey_file is not None:
                                 critical_lateral.style.format({
                                     'Depth (ft)': '{:.1f}',
                                     'Shock (G)': '{:.1f}'
-                                }).applymap(color_shock, subset=['Shock (G)']),
+                                }).map(color_shock, subset=['Shock (G)']),
                                 height=300
                             )
                             st.caption(f"Total: {len(critical_lateral)} events")
@@ -1138,7 +1138,7 @@ if survey_file is not None:
                                 critical_vibe_axial.style.format({
                                     'Depth (ft)': '{:.1f}',
                                     'Vibe (GRMS)': '{:.2f}'
-                                }).applymap(color_vibe, subset=['Vibe (GRMS)']),
+                                }).map(color_vibe, subset=['Vibe (GRMS)']),
                                 height=300
                             )
                             st.caption(f"Total: {len(critical_vibe_axial)} events")
@@ -1165,7 +1165,7 @@ if survey_file is not None:
                                 critical_vibe_lateral.style.format({
                                     'Depth (ft)': '{:.1f}',
                                     'Vibe (GRMS)': '{:.2f}'
-                                }).applymap(color_vibe, subset=['Vibe (GRMS)']),
+                                }).map(color_vibe, subset=['Vibe (GRMS)']),
                                 height=300
                             )
                             st.caption(f"Total: {len(critical_vibe_lateral)} events")
