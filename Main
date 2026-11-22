@@ -898,7 +898,7 @@ st_folium(m, width=1000, height=500, key="map")
 # ========================================
 # FOOTER / CTA
 # ========================================
-st.success("""
+st.success(""")
 A real-time offshore drilling intelligence platform that fuses NOAA buoy data, LAS or CSV data from MWD tools,
 BOEM rig assets, and MWD telemetry into a predictive rig safety and operations dashboard
 — delivering wave propagation forecasts, motion risk, and environmental fusion.
