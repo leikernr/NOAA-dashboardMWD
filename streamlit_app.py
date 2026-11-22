@@ -10,6 +10,7 @@ from math import radians, sin, cos, sqrt, atan2
 import time
 import io
 from typing import Optional
+from mwd_wellbore import parse_las_file, render_wellbore_trajectory
 
 # ========================================
 # PAGE CONFIG & TITLE
@@ -194,94 +195,7 @@ if not selected_buoys:
 # ========================================
 # SURVEY DATA PROCESSING FUNCTIONS
 # ========================================
-def parse_las_file(file_content: bytes) -> tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """Parse LAS file and extract both survey data and MWD logging data"""
-    try:
-        content = file_content.decode('utf-8')
-        lines = content.split('\n')
-        
-        # Find survey data section (in ~Other Information)
-        survey_lines = []
-        mwd_lines = []
-        in_survey_section = False
-        in_mwd_section = False
-        
-        for line in lines:
-            stripped = line.strip()
-            
-            # Check for section markers
-            if '# Survey Data' in line:
-                in_survey_section = True
-                in_mwd_section = False
-                continue
-            elif stripped.startswith('~ASCII LOG DATA SECTION'):
-                in_survey_section = False
-                in_mwd_section = True
-                continue
-            elif stripped.startswith('~') and in_survey_section:
-                in_survey_section = False
-            
-            if not stripped or stripped.startswith('#') or stripped.startswith('~'):
-                continue
-            
-            parts = stripped.split()
-            
-            # Parse survey data (numeric lines with 7+ columns in survey section)
-            if in_survey_section and len(parts) >= 7:
-                try:
-                    float(parts[0])
-                    survey_lines.append([float(parts[i]) for i in range(min(12, len(parts)))])
-                except (ValueError, IndexError):
-                    continue
-            
-            # Parse MWD logging data (DATE TIME DEP GR VS TVD ROP Temp Shka ShkL VibeA VibeL)
-            elif in_mwd_section and len(parts) >= 12:
-                try:
-                    # Skip if first part is not a date
-                    if '-' in parts[0]:
-                        # Parse: DATE TIME DEP GR VS TVD ROP Temp Shka ShkL VibeA VibeL
-                        mwd_data = {
-                            'DATE': parts[0],
-                            'TIME': parts[1],
-                            'DEP': float(parts[2]),
-                            'GR': float(parts[3]),
-                            'VS': float(parts[4]),
-                            'TVD': float(parts[5]),
-                            'ROP': float(parts[6]),
-                            'TEMP': float(parts[7]),
-                            'SHKA': float(parts[8]),
-                            'SHKL': float(parts[9]),
-                            'VIBEA': float(parts[10]),
-                            'VIBEL': float(parts[11])
-                        }
-                        mwd_lines.append(mwd_data)
-                except (ValueError, IndexError):
-                    continue
-        
-        # Create survey dataframe
-        survey_df = None
-        if survey_lines:
-            # Determine number of columns
-            ncols = len(survey_lines[0])
-            if ncols >= 12:
-                cols = ['MD', 'INC', 'AZM', 'TVD', 'NS', 'EW', 'VS', 'CD', 'CA', 'DLS', 'CL', 'TEMP']
-            elif ncols >= 7:
-                cols = ['MD', 'INC', 'AZM', 'TVD', 'NS', 'EW', 'VS'] + [f'COL{i}' for i in range(7, ncols)]
-            else:
-                return None, None
-            survey_df = pd.DataFrame(survey_lines, columns=cols[:ncols])
-        
-        # Create MWD logging dataframe
-        mwd_df = None
-        if mwd_lines:
-            mwd_df = pd.DataFrame(mwd_lines)
-            # Convert TVD to positive
-            mwd_df['TVD'] = mwd_df['TVD'].abs()
-        
-        return survey_df, mwd_df
-    except Exception as e:
-        st.error(f"LAS parsing error: {str(e)}")
-        return None, None
+# parse_las_file is imported from mwd_wellbore
 
 # ========================================
 # MWD CONFIG FILE PARSER
@@ -703,79 +617,8 @@ if survey_file is not None:
             st.metric("Final East/West", f"{survey_df['EW'].iloc[-1]:.0f} ft")
             st.metric("Survey Stations", f"{len(survey_df)}")
         
-        # 3D Wellbore Trajectory
-        st.markdown("### 3D Wellbore Trajectory")
-        fig_3d = go.Figure()
-        
-        fig_3d.add_trace(go.Scatter3d(
-            x=survey_df['EW'],
-            y=survey_df['NS'],
-            z=survey_df['TVD'],  # Positive TVD with reversed axis
-            mode='lines+markers',
-            marker=dict(
-                size=4,
-                color=survey_df['MD'],
-                colorscale='Viridis',
-                showscale=True,
-                colorbar=dict(
-                    title=dict(
-                        text="Measured<br>Depth (ft)",
-                        font=dict(color='cyan', size=14, family='Arial Black')
-                    ),
-                    tickfont=dict(color='cyan', size=12, family='Arial Black'),
-                    bgcolor='rgba(0,0,0,0.9)',
-                    outlinecolor='cyan',
-                    outlinewidth=2,
-                    x=1.15,
-                    xanchor='left',
-                    thickness=20,
-                    len=0.7
-                )
-            ),
-            line=dict(color='cyan', width=3),
-            text=[f"MD: {md:.0f} ft<br>TVD: {tvd:.0f} ft<br>Inc: {inc:.1f}°<br>Azm: {azm:.1f}°" 
-                  for md, tvd, inc, azm in zip(survey_df['MD'], survey_df['TVD'], survey_df['INC'], survey_df['AZM'])],
-            hovertemplate='<b>E/W:</b> %{x:.0f} ft<br><b>N/S:</b> %{y:.0f} ft<br>%{text}<extra></extra>',
-            name='Well Path'
-        ))
-        
-        # Add surface marker
-        fig_3d.add_trace(go.Scatter3d(
-            x=[0], y=[0], z=[0],
-            mode='markers',
-            marker=dict(size=10, color='red', symbol='diamond'),
-            name='Surface Location',
-            hovertemplate='<b>Surface</b><extra></extra>'
-        ))
-        
-        # Add target/TD marker
-        fig_3d.add_trace(go.Scatter3d(
-            x=[survey_df['EW'].iloc[-1]],
-            y=[survey_df['NS'].iloc[-1]],
-            z=[survey_df['TVD'].iloc[-1]],
-            mode='markers',
-            marker=dict(size=10, color='lime', symbol='diamond'),
-            name='Total Depth',
-            hovertemplate=f"<b>Total Depth</b><br>TVD: {survey_df['TVD'].iloc[-1]:.0f} ft<extra></extra>"
-        ))
-        
-        fig_3d.update_layout(
-            scene=dict(
-                xaxis_title='East/West (ft)',
-                yaxis_title='North/South (ft)',
-                zaxis_title='TVD (ft)',
-                zaxis=dict(autorange='reversed'),  # Reverse z-axis to show positive depth values
-                aspectmode='data',
-                camera=dict(
-                    eye=dict(x=1.5, y=1.5, z=0.5)
-                )
-            ),
-            height=600,
-            template='plotly_dark',
-            showlegend=True
-        )
-        
-        st.plotly_chart(fig_3d, use_container_width=True)
+        # 3D Wellbore Trajectory (WebGL-free SVG + 2D Plan/Section views)
+        render_wellbore_trajectory(survey_df)
         
         # Dogleg Severity Profile
         col1, col2 = st.columns(2)
