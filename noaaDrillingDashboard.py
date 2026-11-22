@@ -414,8 +414,6 @@ if survey_file is not None:
     survey_df, mwd_logging_df = load_survey_data(survey_file)
     
     if survey_df is not None and not survey_df.empty:
-        st.warning("⚠️ **Confidentiality Notice**: Company names, operators, and specific well locations have been anonymized for this demonstration.")
-        
         # Survey Statistics
         col1, col2, col3, col4 = st.columns(4)
         with col1:
